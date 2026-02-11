@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <title>Power BI Internal Report</title>
+    <script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@2.38.1/lib/msal-browser.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/powerbi-client/2.19.1/powerbi.min.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; padding: 20px; background: #f0f2f5; }
+        .box { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); max-width: 600px; margin: auto; }
+        #reportContainer { width: 100%; height: 800px; border: 1px solid #ccc; margin-top: 20px; display: none; background: white; }
+        button { padding: 10px 20px; cursor: pointer; background: #0078d4; color: white; border: none; border-radius: 4px; font-weight: bold; }
+        button:hover { background: #005a9e; }
+        input { padding: 9px; width: 200px; border: 1px solid #ccc; border-radius: 4px; }
+        #status { margin-top: 15px; font-weight: bold; color: #28a745; }
+    </style>
+</head>
+<body>
+
+<div class="box">
+    <h2>Hệ thống Báo cáo Nội bộ</h2>
+    <div id="loginSection">
+        <input type="text" id="dbUsername" placeholder="Nhập Username hệ thống">
+        <button onclick="loginSystem()">1. Xác thực hệ thống</button>
+        <button id="btnMS" onclick="loginMicrosoft()" style="display:none; background: #2b88d8;">2. Đăng nhập Microsoft</button>
+    </div>
+    <p id="status"></p>
+</div>
+
+<div id="reportContainer"></div>
+
+<script>
+    const config = {
+        clientId: "34a9a012-370d-41aa-bb37-c41653513164", 
+        tenantId: "972bd407-5501-469b-a60c-1cb78484a366",
+        workspaceId: "ae08f768-cc64-477b-803e-70d078110f50",
+        reportId: "93adc194-7c13-44a9-99fc-80bce22d0d50" //afa7bf14-6f59-4532-86eb-9a0e468c0991
+    };
+
+    const msalInstance = new msal.PublicClientApplication({
+        auth: {
+            clientId: config.clientId,
+            authority: `https://login.microsoftonline.com/${config.tenantId}`,
+            redirectUri: "http://localhost:5500" 
+        }
+    });
+
+    // BƯỚC 1: Lấy phân quyền từ DB
+    async function loginSystem() {
+        const username = document.getElementById('dbUsername').value;
+        try {
+            const res = await fetch('http://localhost:5000/api/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username })
+            });
+            const data = await res.json();
+            
+            if (data.success) {
+                // LƯU Ý: data.user_info bây giờ chứa regions[] và customer_types[]
+                localStorage.setItem('dbUserInfo', JSON.stringify(data.user_info));
+                document.getElementById('status').innerText = "✅ Hệ thống đã nhận diện: " + data.user_info.db_username;
+                document.getElementById('btnMS').style.display = "inline";
+            } else {
+                alert("Username không tồn tại trong SQL!");
+            }
+        } catch (err) {
+            console.error("Lỗi kết nối Server Node.js:", err);
+            alert("Không thể kết nối tới Server.");
+        }
+    }
+
+    async function loginMicrosoft() {
+        try {
+            await msalInstance.loginRedirect({
+                scopes: ["https://analysis.windows.net/powerbi/api/Report.Read.All"]
+            });
+        } catch (err) { console.error(err); }
+    }
+
+    msalInstance.handleRedirectPromise().then(response => {
+        const accounts = msalInstance.getAllAccounts();
+        if (accounts.length > 0) {
+            msalInstance.acquireTokenSilent({
+                account: accounts[0],
+                scopes: ["https://analysis.windows.net/powerbi/api/Report.Read.All"]
+            }).then(authResult => renderReport(authResult.accessToken));
+        }
+    });
+
+    // BƯỚC 3: NHÚNG VÀ ÉP BỘ LỌC
+    async function renderReport(token) {
+        const models = window['powerbi-client'].models;
+        const container = document.getElementById('reportContainer');
+        container.style.display = "block";
+
+        const storedUser = JSON.parse(localStorage.getItem('dbUserInfo'));
+        if (!storedUser) return;
+
+        let reportFilters = [];
+
+        // Nếu không phải ADMIN, tiến hành build mảng filter
+        if (storedUser.db_username.toLowerCase() !== 'admin') {
+            
+            // 1. Lọc Loại khách hàng (Sử dụng mảng customer_types từ BE)
+            if (storedUser.customer_types && storedUser.customer_types.length > 0) {
+                reportFilters.push({
+                    $schema: "http://powerbi.com/product/schema#basic",
+                    target: { table: "dim_customer_type", column: "Customer_Type_Name" },
+                    operator: "In",
+                    values: storedUser.customer_types // Mảng ["B2B"]
+                });
+            }
+
+            // 2. Lọc Phân vùng (Sử dụng mảng regions từ BE)
+            if (storedUser.regions && storedUser.regions.length > 0) {
+                reportFilters.push({
+                    $schema: "http://powerbi.com/product/schema#basic",
+                    target: { table: "Dim_Geography", column: "province" },
+                    operator: "In",
+                    values: storedUser.regions // Mảng ["Lâm Đồng"]
+                });
+            }
+
+            // 3. Lọc chính xác Username để đảm bảo Fact Sales cũng nhảy
+            reportFilters.push({
+                $schema: "http://powerbi.com/product/schema#basic",
+                target: { table: "Dim_User_Access", column: "username" },
+                operator: "In",
+                values: [storedUser.db_username]
+            });
+        }
+
+        const embedConfig = {
+            type: 'report',
+            tokenType: models.TokenType.Aad,
+            accessToken: token,
+            embedUrl: `https://app.powerbi.com/reportEmbed?reportId=${config.reportId}&groupId=${config.workspaceId}`,
+            id: config.reportId,
+            filters: reportFilters, // Áp dụng ngay khi khởi tạo
+            settings: {
+                filterPaneEnabled: false,
+                navContentPaneEnabled: true
+            },
+            
+        };
+
+        const report = powerbi.embed(container, embedConfig);
+
+        // Đảm bảo ép filter lại một lần nữa sau khi load để tránh Slicer bị "bung"
+        report.on("loaded", async () => {
+            if (reportFilters.length > 0) {
+                try {
+                    await report.setFilters(reportFilters);
+                    console.log("✅ Đã khóa dữ liệu thành công theo:", storedUser.db_username);
+                } catch (err) {
+                    console.error("Lỗi áp filter:", err);
+                }
+            }
+        });
+    }
+</script>
+</body>
+</html>
